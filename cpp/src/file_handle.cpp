@@ -267,9 +267,8 @@ void FileHandle::read_async(void* devPtr_base,
   KVIKIO_NVTX_FUNC_RANGE();
   get_compat_mode_manager().validate_compat_mode_for_async();
   if (get_compat_mode_manager().is_compat_mode_preferred_for_async()) {
-    CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
-    *bytes_read_p =
-      static_cast<ssize_t>(read(devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p));
+    *bytes_read_p = static_cast<ssize_t>(detail::posix_device_read(
+      _file_direct_off.fd(), devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p, stream));
   } else {
     CUFILE_TRY(cuFileAPI::instance().ReadAsync(_cufile_handle.handle(),
                                                devPtr_base,
@@ -302,9 +301,8 @@ void FileHandle::write_async(void* devPtr_base,
   KVIKIO_NVTX_FUNC_RANGE();
   get_compat_mode_manager().validate_compat_mode_for_async();
   if (get_compat_mode_manager().is_compat_mode_preferred_for_async()) {
-    CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
-    *bytes_written_p =
-      static_cast<ssize_t>(write(devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p));
+    *bytes_written_p = static_cast<ssize_t>(detail::posix_device_write(
+      _file_direct_off.fd(), devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p, stream));
   } else {
     CUFILE_TRY(cuFileAPI::instance().WriteAsync(_cufile_handle.handle(),
                                                 devPtr_base,
