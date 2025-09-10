@@ -126,6 +126,7 @@ ssize_t posix_host_io(int fd, void const* buf, size_t count, off_t offset)
  * @param size Number of bytes to read or write.
  * @param file_offset Byte offset to the start of the file.
  * @param devPtr_offset Byte offset to the start of the device pointer.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses StreamsByThread::get().
  * @return Number of bytes read or written.
  */
 template <IOOperationType Operation>
@@ -133,7 +134,8 @@ std::size_t posix_device_io(int fd,
                             void const* devPtr_base,
                             std::size_t size,
                             std::size_t file_offset,
-                            std::size_t devPtr_offset)
+                            std::size_t devPtr_offset,
+                            CUstream stream = nullptr)
 {
   auto alloc              = AllocRetain::instance().get();
   CUdeviceptr devPtr      = convert_void2deviceptr(devPtr_base) + devPtr_offset;
@@ -141,8 +143,11 @@ std::size_t posix_device_io(int fd,
   off_t byte_remaining    = convert_size2off(size);
   off_t const chunk_size2 = convert_size2off(alloc.size());
 
-  // Get a stream for the current CUDA context and thread
-  CUstream stream = StreamsByThread::get();
+  // Use provided stream or get a stream for the current CUDA context and thread
+  bool should_synchronize = (stream == nullptr);
+  if (stream == nullptr) {
+    stream = StreamsByThread::get();
+  }
 
   while (byte_remaining > 0) {
     off_t const nbytes_requested = std::min(chunk_size2, byte_remaining);
@@ -151,11 +156,15 @@ std::size_t posix_device_io(int fd,
       nbytes_got = posix_host_io<IOOperationType::READ, PartialIO::YES>(
         fd, alloc.get(), nbytes_requested, cur_file_offset);
       CUDA_DRIVER_TRY(cudaAPI::instance().MemcpyHtoDAsync(devPtr, alloc.get(), nbytes_got, stream));
-      CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+      if (should_synchronize) {
+        CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+      }
     } else {  // Is a write operation
       CUDA_DRIVER_TRY(
         cudaAPI::instance().MemcpyDtoHAsync(alloc.get(), devPtr, nbytes_requested, stream));
-      CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+      if (should_synchronize) {
+        CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
+      }
       posix_host_io<IOOperationType::WRITE, PartialIO::NO>(
         fd, alloc.get(), nbytes_requested, cur_file_offset);
     }
@@ -221,13 +230,15 @@ std::size_t posix_host_write(int fd, void const* buf, std::size_t size, std::siz
  * @param size Size in bytes to read.
  * @param file_offset Offset in the file to read from.
  * @param devPtr_offset Offset relative to the `devPtr_base` pointer to read into.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses StreamsByThread::get().
  * @return Size of bytes that were successfully read.
  */
 std::size_t posix_device_read(int fd,
                               void const* devPtr_base,
                               std::size_t size,
                               std::size_t file_offset,
-                              std::size_t devPtr_offset);
+                              std::size_t devPtr_offset,
+                              CUstream stream = nullptr);
 
 /**
  * @brief Write device memory to disk using POSIX
@@ -240,12 +251,14 @@ std::size_t posix_device_read(int fd,
  * @param size Size in bytes to write.
  * @param file_offset Offset in the file to write to.
  * @param devPtr_offset Offset relative to the `devPtr_base` pointer to write into.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses StreamsByThread::get().
  * @return Size of bytes that were successfully written.
  */
 std::size_t posix_device_write(int fd,
                                void const* devPtr_base,
                                std::size_t size,
                                std::size_t file_offset,
-                               std::size_t devPtr_offset);
+                               std::size_t devPtr_offset,
+                               CUstream stream = nullptr);
 
 }  // namespace kvikio::detail
