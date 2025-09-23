@@ -157,6 +157,7 @@ set(SOURCES
     "src/shim/cufile.cpp"
     "src/shim/utils.cpp"
     "src/stream.cpp"
+    "src/streams_by_thread.cpp"
     "src/utils.cpp"
 )
 
