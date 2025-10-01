@@ -116,6 +116,10 @@ class cudaAPI {
   decltype(cuStreamCreate)* StreamCreate{nullptr};
   decltype(cuStreamDestroy)* StreamDestroy{nullptr};
   decltype(cuDriverGetVersion)* DriverGetVersion{nullptr};
+  decltype(cuEventCreate)* EventCreate{nullptr};
+  decltype(cuEventRecord)* EventRecord{nullptr};
+  decltype(cuEventSynchronize)* EventSynchronize{nullptr};
+  decltype(cuStreamWaitEvent)* StreamWaitEvent{nullptr};
 
  private:
   cudaAPI();

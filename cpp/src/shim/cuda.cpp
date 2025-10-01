@@ -50,6 +50,10 @@ cudaAPI::cudaAPI()
   get_symbol(StreamCreate, lib, KVIKIO_STRINGIFY(cuStreamCreate));
   get_symbol(StreamDestroy, lib, KVIKIO_STRINGIFY(cuStreamDestroy));
   get_symbol(DriverGetVersion, lib, KVIKIO_STRINGIFY(cuDriverGetVersion));
+  get_symbol(EventCreate, lib, KVIKIO_STRINGIFY(cuEventCreate));
+  get_symbol(EventRecord, lib, KVIKIO_STRINGIFY(cuEventRecord));
+  get_symbol(EventSynchronize, lib, KVIKIO_STRINGIFY(cuEventSynchronize));
+  get_symbol(StreamWaitEvent, lib, KVIKIO_STRINGIFY(cuStreamWaitEvent));
 
   CUDA_DRIVER_TRY(DriverGetVersion(&driver_version));
 
