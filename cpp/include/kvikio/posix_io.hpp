@@ -120,12 +120,23 @@ ssize_t posix_host_io(int fd, void const* buf, size_t count, off_t offset)
 /**
  * @brief Read or write device memory to or from disk using POSIX
  *
+ * This function will always synchronize the provided stream to ensure that
+ * there are no races between the POSIX I/O and the associated CUDA memcpy
+ * operations. If asynchrony is required, this function should be called on a
+ * separate worker thread.
+ *
+ * TODO: Determine whether we ever actually need to provide a different stream
+ * or if we are OK blocking the thread on the stream sync. If we don't need to
+ * then we don't need a stream parameter here ever.
+ *
  * @tparam Operation Whether the operation is a read or a write.
  * @param fd File descriptor
  * @param devPtr_base Device pointer to read or write to.
  * @param size Number of bytes to read or write.
  * @param file_offset Byte offset to the start of the file.
  * @param devPtr_offset Byte offset to the start of the device pointer.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses
+ * StreamsByThread::get().
  * @return Number of bytes read or written.
  */
 template <IOOperationType Operation>
@@ -133,7 +144,8 @@ std::size_t posix_device_io(int fd,
                             void const* devPtr_base,
                             std::size_t size,
                             std::size_t file_offset,
-                            std::size_t devPtr_offset)
+                            std::size_t devPtr_offset,
+                            CUstream stream = nullptr)
 {
   auto alloc              = AllocRetain::instance().get();
   CUdeviceptr devPtr      = convert_void2deviceptr(devPtr_base) + devPtr_offset;
@@ -141,8 +153,8 @@ std::size_t posix_device_io(int fd,
   off_t byte_remaining    = convert_size2off(size);
   off_t const chunk_size2 = convert_size2off(alloc.size());
 
-  // Get a stream for the current CUDA context and thread
-  CUstream stream = StreamsByThread::get();
+  // Use provided stream or get a stream for the current CUDA context and thread
+  if (stream == nullptr) { stream = StreamsByThread::get(); }
 
   while (byte_remaining > 0) {
     off_t const nbytes_requested = std::min(chunk_size2, byte_remaining);
@@ -221,13 +233,16 @@ std::size_t posix_host_write(int fd, void const* buf, std::size_t size, std::siz
  * @param size Size in bytes to read.
  * @param file_offset Offset in the file to read from.
  * @param devPtr_offset Offset relative to the `devPtr_base` pointer to read into.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses
+ * StreamsByThread::get().
  * @return Size of bytes that were successfully read.
  */
 std::size_t posix_device_read(int fd,
                               void const* devPtr_base,
                               std::size_t size,
                               std::size_t file_offset,
-                              std::size_t devPtr_offset);
+                              std::size_t devPtr_offset,
+                              CUstream stream = nullptr);
 
 /**
  * @brief Write device memory to disk using POSIX
@@ -240,12 +255,15 @@ std::size_t posix_device_read(int fd,
  * @param size Size in bytes to write.
  * @param file_offset Offset in the file to write to.
  * @param devPtr_offset Offset relative to the `devPtr_base` pointer to write into.
+ * @param stream Optional CUDA stream to use for the operation. If nullptr, uses
+ * StreamsByThread::get().
  * @return Size of bytes that were successfully written.
  */
 std::size_t posix_device_write(int fd,
                                void const* devPtr_base,
                                std::size_t size,
                                std::size_t file_offset,
-                               std::size_t devPtr_offset);
+                               std::size_t devPtr_offset,
+                               CUstream stream = nullptr);
 
 }  // namespace kvikio::detail
