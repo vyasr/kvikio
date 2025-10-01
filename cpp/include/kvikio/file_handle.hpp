@@ -254,6 +254,45 @@ class FileHandle {
                                  bool sync_default_stream  = true);
 
   /**
+   * @brief Reads specified bytes from the file into the device or host memory in parallel.
+   *
+   * This API is a parallel async version of `.read()` that partition the operation
+   * into tasks of size `task_size` for execution in the default thread pool.
+   *
+   * In order to improve performance of small buffers, when `size < gds_threshold` a shortcut
+   * that circumvent the threadpool and use the POSIX backend directly is used.
+   *
+   * @note For cuFile reads, the base address of the allocation `buf` is part of is used.
+   * This means that when registering buffers, use the base address of the allocation.
+   * This is what `memory_register` and `memory_deregister` do automatically.
+   *
+   * @param buf Address to device or host memory.
+   * @param size Size in bytes to read.
+   * @param file_offset Offset in the file to read from.
+   * @param task_size Size of each task in bytes.
+   * @param gds_threshold Minimum buffer size to use GDS and the thread pool.
+   * @param sync_default_stream Synchronize the CUDA default (null) stream prior to calling cuFile.
+   * Contrary to most of the non-async CUDA API, cuFile does not have the semantic of being ordered
+   * with respect to other non-cuFile work in the default stream. By enabling `sync_default_stream`,
+   * KvikIO will synchronize the default stream and order the operation with respect to other work
+   * in the null stream. When in KvikIO's compatibility mode or when accessing host memory, the
+   * operation is always default stream ordered like the rest of the non-async CUDA API. In this
+   * case, the value of `sync_default_stream` is ignored.
+   * @return Future that on completion returns the size of bytes that were successfully read.
+   *
+   * @note The `std::future` object's `wait()` or `get()` should not be called after the lifetime of
+   * the FileHandle object ends. Otherwise, the behavior is undefined.
+   */
+  void pread_async(void* devPtr_base,
+                   std::size_t* size_p,
+                   off_t* file_offset_p,
+                   off_t* devPtr_offset_p,
+                   ssize_t* bytes_read_p,
+                   std::size_t task_size     = defaults::task_size(),
+                   std::size_t gds_threshold = defaults::gds_threshold(),
+                   CUstream stream           = nullptr);
+
+  /**
    * @brief Writes specified bytes from device or host memory into the file in parallel.
    *
    * This API is a parallel async version of `.write()` that partition the operation

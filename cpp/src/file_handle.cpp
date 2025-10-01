@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <cstddef>
 #include <cstdlib>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
@@ -29,6 +30,7 @@
 #include <kvikio/file_handle.hpp>
 #include <kvikio/file_utils.hpp>
 #include <kvikio/nvtx.hpp>
+#include "cuda.h"
 
 namespace kvikio {
 
@@ -257,6 +259,160 @@ std::future<std::size_t> FileHandle::pwrite(void const* buf,
     op, devPtr_base, size, file_offset, task_size, devPtr_offset, call_idx, nvtx_color);
 }
 
+// TODO: This is a free function but it is implicitly tied to the lifetime of
+// the calling FileHandle. Is there a way that we can make that dependence
+// manifest?
+void do_pread_async(int fd,
+                    void* devPtr_base,
+                    std::size_t* size_p,
+                    off_t* file_offset_p,
+                    off_t* devPtr_offset_p,
+                    ssize_t* bytes_read_p,
+                    std::size_t task_size,
+                    std::size_t gds_threshold,
+                    bool compat_mode_preferred_for_async,
+                    CUFileHandleWrapper& cufile_handle,
+                    CUstream stream,
+                    CUevent memory_ready,
+                    CUevent pread_async_done)
+{
+  auto& [nvtx_color, call_idx] = detail::get_next_color_and_call_idx();
+  KVIKIO_NVTX_FUNC_RANGE(call_idx, nvtx_color);
+
+  // Wait on the memory_ready event to ensure that upstream work is done and
+  // all the pointer inputs have been populated.
+  auto ctx = get_context_from_pointer(devPtr_base);
+  {
+    PushAndPopContext c(ctx);
+    CUDA_DRIVER_TRY(cudaAPI::instance().EventSynchronize(memory_ready));
+  }
+
+  if (*size_p < gds_threshold) {
+    PushAndPopContext c(ctx);
+    auto bytes_read = detail::posix_device_read(
+      fd, devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p, detail::StreamsByThread::get());
+  } else if (compat_mode_preferred_for_async) {
+    // TODO: We could include an extra case for CUDA 12.0-12.2 where we have
+    // cufile but not the async APIs and fall back to those. I think that
+    // case is too narrow to be worth handling, though, and also we'd be at
+    // the mercy of cufile's internal stream usage to avoid surprising syncs,
+    // so I would rather we just do the predictable POSIX read in that case.
+    auto task = [=](void* devPtr_base,
+                    std::size_t size,
+                    off_t file_offset_p,
+                    off_t devPtr_offset_p) -> std::size_t {
+      CUcontext ctx = get_context_from_pointer(devPtr_base);
+      PushAndPopContext c(ctx);
+      return detail::posix_device_read(fd, devPtr_base, size, file_offset_p, devPtr_offset_p);
+    };
+
+    // Now launch all the tasks
+    // TODO: Is it worth reducing some overhead by writing a version of this
+    // code that doesn't produce a future? Probably not since we need all but the final task
+    // to still use futures.
+    auto ret = parallel_io(task, devPtr_base, *size_p, *file_offset_p, task_size, *devPtr_offset_p);
+    *bytes_read_p = ret.get();
+  } else {
+    // In this case we use a single cuFileReadAsync call
+    // TODO: Test the behavior of submitting multiple cuFileReadAsync calls in a thread pool as
+    // well.
+    // TODO: Figure out how to validate that async compat mode is allowed
+    // get_compat_mode_manager().validate_compat_mode_for_async();
+    CUcontext ctx = get_context_from_pointer(devPtr_base);
+    PushAndPopContext c(ctx);
+    cuFileAPI::instance().ReadAsync(cufile_handle.handle(),
+                                    devPtr_base,
+                                    size_p,
+                                    file_offset_p,
+                                    devPtr_offset_p,
+                                    bytes_read_p,
+                                    stream);
+  }
+  // In the case where we used cuFileReadAsync, we don't actually need the
+  // event since the operation is intrinsically stream-ordered, but we need it
+  // in all other cases so we must do it unconditionally so that we can wait on
+  // the event in the calling thread.
+  CUDA_DRIVER_TRY(cudaAPI::instance().EventRecord(pread_async_done, stream));
+  return;
+}
+
+/*
+ * Function flow:
+ * 1. Create and record event A on the input stream
+ * 2. Create event B
+ * 3. Launch a new thread (call it the worker thread), pass it event B
+ * 4. The worker thread waits on event A with cudaEventSynchronize
+ * 5. The worker thread checks the input size.
+ * 6. If the size is below the threshold:
+ *     1. Do a single POSIX read
+ *     2. cudaMemcpyAsync on the original input stream
+ *     3. Synchronizes the stream (necessary to ensure the lifetime of the POSIX-read buffer lasts
+ * through the cudaMemcpyAsync)
+ *     4. cudaEventRecord of event B to signal that the work is done
+ * 7. If the size is above the threshold:
+ *     1. If GDS is available
+ *         1. Use cuFileReadAsync
+ *         2. cudaEventRecord of event B to signal that the work is done
+ *     2. If GDS is not available:
+ *         1. Create a thread pool
+ *         2. Split up the work into multiple tasks based on the size
+ *         3. Each task does a POSIX read followed by a cudaMemcpyAsync on a StreamPerThread stream
+ *         4. The worker thread does the final read and then waits on all of the tasks to finish
+ *         5. cudaEventRecord of event B to signal that the work is done
+ */
+
+void FileHandle::pread_async(void* devPtr_base,
+                             std::size_t* size_p,
+                             off_t* file_offset_p,
+                             off_t* devPtr_offset_p,
+                             ssize_t* bytes_read_p,
+                             std::size_t task_size,
+                             std::size_t gds_threshold,
+                             CUstream stream)
+{
+  auto& [nvtx_color, call_idx] = detail::get_next_color_and_call_idx();
+  KVIKIO_NVTX_FUNC_RANGE(call_idx, nvtx_color);
+
+  KVIKIO_EXPECT(!is_host_memory(devPtr_base), "devPtr_base must be a device pointer");
+  CUcontext ctx = get_context_from_pointer(devPtr_base);
+  KVIKIO_EXPECT(
+    stream == nullptr || get_context_associated_pointer(convert_void2deviceptr(stream)).has_value(),
+    "stream must be associated with the context");
+
+  // memory_ready is the indicator that upstream work is completed, so we
+  // record it immediately and send it to the worker threads to wait on.
+  // pread_async_done is the indication that the worker threads are completed
+  // and therefore what the main thread will tell the calling stream to wait
+  // on at the end of this function
+  CUevent memory_ready, pread_async_done;
+  {
+    PushAndPopContext c(ctx);
+    CUDA_DRIVER_TRY(cudaAPI::instance().EventCreate(&memory_ready, 0));
+    CUDA_DRIVER_TRY(cudaAPI::instance().EventRecord(memory_ready, stream));
+
+    CUDA_DRIVER_TRY(cudaAPI::instance().EventCreate(&pread_async_done, 0));
+  }
+
+  // All synchronization is done via streams, so we use detach_task instead of submit_task
+  defaults::thread_pool().detach_task([=, this] {
+    KVIKIO_NVTX_SCOPED_RANGE("pread_async_task", call_idx, nvtx_color);
+    return do_pread_async(this->_file_direct_off.fd(),
+                          devPtr_base,
+                          size_p,
+                          file_offset_p,
+                          devPtr_offset_p,
+                          bytes_read_p,
+                          task_size,
+                          gds_threshold,
+                          get_compat_mode_manager().is_compat_mode_preferred_for_async(),
+                          this->_cufile_handle,
+                          stream,
+                          memory_ready,
+                          pread_async_done);
+  });
+  CUDA_DRIVER_TRY(cudaAPI::instance().StreamWaitEvent(stream, pread_async_done, 0));
+}
+
 void FileHandle::read_async(void* devPtr_base,
                             std::size_t* size_p,
                             off_t* file_offset_p,
@@ -267,9 +423,8 @@ void FileHandle::read_async(void* devPtr_base,
   KVIKIO_NVTX_FUNC_RANGE();
   get_compat_mode_manager().validate_compat_mode_for_async();
   if (get_compat_mode_manager().is_compat_mode_preferred_for_async()) {
-    CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
-    *bytes_read_p =
-      static_cast<ssize_t>(read(devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p));
+    *bytes_read_p = static_cast<ssize_t>(detail::posix_device_read(
+      _file_direct_off.fd(), devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p, stream));
   } else {
     CUFILE_TRY(cuFileAPI::instance().ReadAsync(_cufile_handle.handle(),
                                                devPtr_base,
@@ -302,9 +457,8 @@ void FileHandle::write_async(void* devPtr_base,
   KVIKIO_NVTX_FUNC_RANGE();
   get_compat_mode_manager().validate_compat_mode_for_async();
   if (get_compat_mode_manager().is_compat_mode_preferred_for_async()) {
-    CUDA_DRIVER_TRY(cudaAPI::instance().StreamSynchronize(stream));
-    *bytes_written_p =
-      static_cast<ssize_t>(write(devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p));
+    *bytes_written_p = static_cast<ssize_t>(detail::posix_device_write(
+      _file_direct_off.fd(), devPtr_base, *size_p, *file_offset_p, *devPtr_offset_p, stream));
   } else {
     CUFILE_TRY(cuFileAPI::instance().WriteAsync(_cufile_handle.handle(),
                                                 devPtr_base,
